@@ -67,6 +67,9 @@ def is_valid_link(link_url, domain):
     # Проверяем, что домен совпадает
     if parsed_url.netloc != domain:
         return False
+    # Проверяем, начинается ли путь URL с указанного пути в START_PATH
+    if cfg.START_PATH and not parsed_url.path.startswith(cfg.START_PATH):
+        return False
     # Игнорируем ссылки с параметрами запроса или якорями
     if parsed_url.query or parsed_url.fragment:
         return False
