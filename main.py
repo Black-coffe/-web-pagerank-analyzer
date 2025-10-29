@@ -22,33 +22,6 @@ def remove_existing_files(db_path, excel_path):
     if os.path.isfile(excel_path):
         os.remove(excel_path)
 
-# Далее идет остальная часть скрипта...
-def get_links(url):
-    try:
-        response = requests.get(url)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        links = soup.find_all('a', href=True)
-        return [link['href'] for link in links]
-    except Exception as e:
-        logging.error(f"Error fetching links from {url}: {str(e)}")
-        return []
-
-def aggregate_anchor_texts(visited_pages, cursor):
-    logging.info("Aggregating anchor texts...")
-    anchor_texts = {}
-    for url in visited_pages:
-        cursor.execute("SELECT anchor_text, destination_url FROM links WHERE source_url=?", (url,))
-        rows = cursor.fetchall()
-        for row in rows:
-            anchor = row[0]
-            link_url = row[1]
-            if anchor:
-                if (anchor, link_url) not in anchor_texts:
-                    anchor_texts[(anchor, link_url)] = 0
-                anchor_texts[(anchor, link_url)] += 1
-    logging.info("Anchor text aggregation completed.")
-    return anchor_texts
-
 # Создаем базу данных
 def create_database(db_file):
     conn = sqlite3.connect(db_file)
@@ -70,11 +43,18 @@ def is_valid_link(link_url, domain):
     # Проверяем, начинается ли путь URL с указанного пути в START_PATH
     if cfg.START_PATH and not parsed_url.path.startswith(cfg.START_PATH):
         return False
-    # Игнорируем ссылки с параметрами запроса или якорями
-    if parsed_url.query or parsed_url.fragment:
+    # Игнорируем якоря (фрагменты)
+    if parsed_url.fragment:
         return False
-    # Игнорируем не-HTML страницы (например, ссылки на файлы)
-    if not (parsed_url.path.endswith('/') or parsed_url.path.endswith('.html') or parsed_url.path.endswith('.htm')):
+    # Игнорируем параметры запроса, если настройка включена
+    if cfg.IGNORE_QUERY_PARAMS and parsed_url.query:
+        return False
+    # Игнорируем файлы (изображения, документы, архивы и т.д.)
+    # Разрешаем HTML страницы, чистые URL и URL с /
+    file_extensions_to_ignore = ['.jpg', '.jpeg', '.png', '.gif', '.pdf', '.doc', '.docx',
+                                   '.xls', '.xlsx', '.zip', '.rar', '.css', '.js', '.xml',
+                                   '.json', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot']
+    if any(parsed_url.path.lower().endswith(ext) for ext in file_extensions_to_ignore):
         return False
     return True
 
@@ -85,63 +65,98 @@ def get_page_data(url, cursor, domain):
     elapsed_time = time.time() - start_time
     time_str = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
     print(f"Time: {time_str} | Page № {page_count} | Fetching data from: {url}")
+
+    # Задержка перед запросом для избежания перегрузки сервера
+    if page_count > 1:
+        time.sleep(cfg.REQUEST_DELAY)
+
+    # Retry логика
+    response = None
+    status_code = 'Fetch Error'
+    headers = {'User-Agent': cfg.USER_AGENT}
+
+    for attempt in range(cfg.MAX_RETRIES):
+        try:
+            response = requests.get(url, timeout=cfg.TIMEOUT, headers=headers)
+            break  # Успешный запрос, выходим из цикла
+        except requests.exceptions.Timeout:
+            logging.warning(f"Timeout on {url}, attempt {attempt + 1}/{cfg.MAX_RETRIES}")
+            if attempt == cfg.MAX_RETRIES - 1:
+                logging.error(f"Failed to fetch {url} after {cfg.MAX_RETRIES} attempts (timeout)")
+                return 'Timeout'
+            time.sleep(2 ** attempt)  # Экспоненциальная задержка: 1s, 2s, 4s
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Request error on {url}: {str(e)}, attempt {attempt + 1}/{cfg.MAX_RETRIES}")
+            if attempt == cfg.MAX_RETRIES - 1:
+                logging.error(f"Failed to fetch {url} after {cfg.MAX_RETRIES} attempts: {str(e)}")
+                return 'Request Error'
+            time.sleep(2 ** attempt)
+
+    # Если response None (не должно быть после retry), возвращаем ошибку
+    if response is None:
+        return 'Fetch Error'
+
     try:
-        response = requests.get(url, timeout=cfg.TIMEOUT)
-        # По умолчанию статус кода - ошибка, если не удастся получить страницу
-        status_code = 'Fetch Error'
+        status_code = str(response.status_code)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Извлекаем метаданные страницы перед фильтрацией
             title = soup.title.string if soup.title else "No title"
             h1 = soup.h1.string if soup.h1 else "No H1 tag"
-            body_content = ''.join(soup.body.stripped_strings)
+            body_content = ''.join(soup.body.stripped_strings) if soup.body else ""
             text_length = len(body_content)
             status_code = response.status_code
 
-            # Изменение: исключение ссылок в определенных классах, ID и тегах
-            content_soup = BeautifulSoup(response.text, 'html.parser')
+            # Сохраняем данные страницы в БД
+            cursor.execute('INSERT OR REPLACE INTO pages (url, title, h1, text_length, status_code) VALUES (?, ?, ?, ?, ?)',
+                           (url, title, h1, text_length, status_code))
 
+            # Теперь фильтруем soup для извлечения только нужных ссылок
             # Удаление элементов с указанными классами
             for excluded_class in cfg.EXCLUDED_CLASSES:
-                for tag in content_soup.find_all(class_=excluded_class):
+                for tag in soup.find_all(class_=excluded_class):
                     tag.decompose()
 
             # Удаление элементов с указанными ID
             for excluded_id in cfg.EXCLUDED_IDS:
-                tag = content_soup.find(id=excluded_id)
+                tag = soup.find(id=excluded_id)
                 if tag:
                     tag.decompose()
 
             # Удаление элементов с указанными тегами
-            for tag in content_soup.find_all(cfg.EXCLUDED_TAGS):
+            for tag in soup.find_all(cfg.EXCLUDED_TAGS):
                 tag.decompose()
 
             # Изменение: игнорирование ссылок до <h1>
-            h1_tag = content_soup.find('h1')
+            h1_tag = soup.find('h1')
             if h1_tag and cfg.EXCLUDED_LINKS_BEFORE_H1:
-                for a in content_soup.find_all('a', href=True):
+                for a in soup.find_all('a', href=True):
                     if a.find_previous('h1') is None:
                         a.decompose()
 
             # Изменение: игнорирование ссылок из StopLinkList
-            for a in content_soup.find_all('a', href=True):
+            for a in soup.find_all('a', href=True):
                 link_url = urljoin(url, a.get('href'))
                 if link_url in cfg.STOP_LINK_LINKS:
                     a.decompose()
 
-            cursor.execute('INSERT OR REPLACE INTO pages (url, title, h1, text_length, status_code) VALUES (?, ?, ?, ?, ?)',
-                           (url, title, h1, text_length, status_code))
-
             # Вставляем ссылки
-            for a in content_soup.find_all('a', href=True):
+            for a in soup.find_all('a', href=True):
                 link_url = urljoin(url, a.get('href'))
                 if is_valid_link(link_url, domain):
                     anchor = a.get_text(strip=True)
                     cursor.execute('INSERT INTO links (source_url, destination_url, anchor_text) VALUES (?, ?, ?)',
                                    (url, link_url, anchor))
+        else:
+            # Сохраняем информацию о странице с не-200 статусом
+            cursor.execute('INSERT OR REPLACE INTO pages (url, title, h1, text_length, status_code) VALUES (?, ?, ?, ?, ?)',
+                           (url, "Error page", "No H1", 0, status_code))
         return status_code
     except Exception as e:
-        print(f"Error fetching {url}: {str(e)}")
-        return 'Fetch Error'
+        logging.error(f"Error parsing {url}: {str(e)}")
+        print(f"Error parsing {url}: {str(e)}")
+        return 'Parse Error'
 
 
 # Рекурсивный обход сайта и другие функции...
@@ -202,8 +217,13 @@ def export_data_to_excel(site_graph, pageranks, cursor, db_file):
     pages_data = []
     for page in pages_rows:
         url, title, status_code = page
-        incoming_links = len(list(site_graph.predecessors(url)))
-        outgoing_links = len(list(site_graph.successors(url)))
+        # Проверяем, существует ли страница в графе перед получением ссылок
+        if url in site_graph:
+            incoming_links = len(list(site_graph.predecessors(url)))
+            outgoing_links = len(list(site_graph.successors(url)))
+        else:
+            incoming_links = 0
+            outgoing_links = 0
         anchor_text_count = sum(1 for link in links_rows if link[1] == url)
         pagerank = pageranks.get(url, 0)
         pages_data.append([url, title, incoming_links, outgoing_links, anchor_text_count, pagerank, status_code])
